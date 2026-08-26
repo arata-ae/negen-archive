@@ -1,0 +1,11 @@
+# @negen/archive composes over the dsh-web-app bundle layer.
+#
+# It adds one host row for the archive restore/delete HTTP API and one browser
+# row for the sidebar "Archived" footer action. The host row must activate
+# after the webserver and workspace services exist, which the web-app bundle
+# already mounts. `dsh plugin add` appends this bundle after dsh-web-app, so
+# this patch already lands in the right order.
+
+- insert:
+    - id: negen-archive
+      name: "@negen/archive"
