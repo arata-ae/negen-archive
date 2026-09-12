@@ -133,21 +133,43 @@ const handleRestore = async (
   json(res, 200, { ok: true });
 };
 
-const handleDelete = async (
-  ctx: Context,
-  req: IncomingMessage,
-  res: ServerResponse,
-): Promise<void> => {
-  const { sessionId } = await readBody<{ sessionId?: string }>(req);
-  if (sessionId === undefined) {
-    json(res, 400, { error: "sessionId is required" });
-    return;
-  }
-  const id = sessionId as SessionId;
+/**
+ * How one delete attempt ended; the route maps this onto an HTTP status.
+ *
+ * `missing` and `unsupported` are decided before anything is mutated, so a
+ * client that sees either one still has a complete session on disk.
+ */
+export type DeleteOutcome =
+  | { readonly kind: "deleted" }
+  | { readonly kind: "missing" }
+  | { readonly kind: "unsupported" };
 
-  // Stop any live agent before sending the session to the OS trash. Cancelling
-  // clears the active turn and waits for quiescence; the row can then be
-  // deleted safely even when it was the currently open thread.
+/** Move one path to the operating system's trash. */
+export type TrashMove = (target: string) => void;
+
+/**
+ * Stop, detach, drain, then trash one session and drop it from the archive set.
+ *
+ * The order is the whole point. `session/disposed` is what makes the
+ * persistence backend close the session's write handle, and closing drains the
+ * handle's buffered events through the *original* path with recursive `mkdir`,
+ * so a drain that lands after the move re-creates the log and the deleted
+ * thread comes back on the next list refresh. Detaching first, then waiting the
+ * drain out, is what keeps the move final.
+ * @param ctx - Host cordis context.
+ * @param id - the session to delete.
+ * @param move - the trash move, injectable so tests can run the sequence
+ *   without moving anything to a real operating-system trash.
+ * @returns how the attempt ended.
+ */
+export const deleteSession = async (
+  ctx: Context,
+  id: SessionId,
+  move: TrashMove = moveToOsTrash,
+): Promise<DeleteOutcome> => {
+  // Stop any live agent before the session is taken apart. Cancelling clears
+  // the active turn and waits for quiescence; the row can then be deleted
+  // safely even when it was the currently open thread.
   const agent = ctx.get("agents")?.get(id) as
     | {
         cancel(cause: { kind: "user" }): void;
@@ -160,33 +182,91 @@ const handleDelete = async (
   }
 
   const header = await findHeader(ctx, id);
-  if (header === undefined) {
-    json(res, 404, { error: "session-not-found" });
-    return;
-  }
+  if (header === undefined) return { kind: "missing" };
 
-  const location = ctx.sessionPersistence.locate(header);
-  if (location === undefined) {
-    json(res, 501, {
-      error: "this persistence backend has no per-session artifact to move",
-    });
-    return;
-  }
+  // `locate` left the persistence service in 0.1.5; the JSONL backend still
+  // holds it as a private helper, and it stays the only thing that knows where
+  // one session's artifacts live. The optional call keeps every other backend
+  // on the same 501 as before.
+  const location = (
+    ctx.sessionPersistence as unknown as {
+      locate?(meta: SessionHeader): { kind: string; path: string } | undefined;
+    }
+  ).locate?.(header);
+  if (location === undefined) return { kind: "unsupported" };
 
-  const source = dirname(location.path);
-  moveToOsTrash(source);
-  await removeFromArchive(ctx, id);
   detachLiveSession(ctx, id);
-  json(res, 200, { ok: true });
+  await settleWrites(ctx, id);
+
+  move(dirname(location.path));
+  await removeFromArchive(ctx, id);
+  return { kind: "deleted" };
+};
+
+const handleDelete = async (
+  ctx: Context,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> => {
+  const { sessionId } = await readBody<{ sessionId?: string }>(req);
+  if (sessionId === undefined) {
+    json(res, 400, { error: "sessionId is required" });
+    return;
+  }
+
+  const outcome = await deleteSession(ctx, sessionId as SessionId);
+  switch (outcome.kind) {
+    case "deleted":
+      json(res, 200, { ok: true });
+      return;
+    case "missing":
+      json(res, 404, { error: "session-not-found" });
+      return;
+    case "unsupported":
+      json(res, 501, {
+        error: "this persistence backend has no per-session artifact to move",
+      });
+      return;
+    default: {
+      // Exhaustiveness guard: a new DeleteOutcome kind fails the build here
+      // rather than falling through to a silently wrong status.
+      const unhandled: never = outcome;
+      throw new Error(`negen-archive: unhandled delete outcome ${JSON.stringify(unhandled)}`);
+    }
+  }
+};
+
+/**
+ * Wait until a detached session can no longer write.
+ *
+ * Closing the write handle happens asynchronously behind `session/disposed` and
+ * nobody awaits it, so the service-wide durability barrier is the only public
+ * way to settle the drain before the files move. Absence from the backend's
+ * writer set already means the drain finished; otherwise this waits on the same
+ * handle. A failure is reported and ignored: another session's write fault must
+ * not pin this one to disk, and this session's bytes are being deleted anyway.
+ * @param ctx - Host cordis context.
+ * @param id - the session that was just detached, named in the diagnostic.
+ */
+const settleWrites = async (ctx: Context, id: SessionId): Promise<void> => {
+  try {
+    await ctx.sessionPersistence.flush();
+  } catch (error: unknown) {
+    ctx.logger.warn(
+      `negen-archive: could not confirm the final write for "${id}" before deleting it: ${String(error)}`,
+    );
+  }
 };
 
 /**
  * Remove a deleted session from the in-memory registries so the browser list
- * updates without restarting the harness.
+ * updates without restarting the harness, and so the persistence backend sees
+ * the `session/disposed` edge that closes the session's write handle.
  *
  * This is intentionally a private-internals compatibility hook. Upstream keeps
- * the disposer as an owner-only capability, and there is no public delete
- * API, so this reaches the same entry objects the harness itself uses.
+ * the disposer as an owner-only capability — an agent's `dispose()` reaches
+ * only whoever created it, and there is no public delete API — so this reaches
+ * the same entry objects the harness itself uses.
  */
 const detachLiveSession = (ctx: Context, id: SessionId): void => {
   const sessions = ctx.get("sessions") as unknown as {
@@ -204,9 +284,25 @@ const detachLiveSession = (ctx: Context, id: SessionId): void => {
   }
 };
 
+/**
+ * Remove one session from the registry-global archive set, which is what
+ * "restore" means.
+ *
+ * Upstream has no public unarchive verb (0.1.5 exposes `archiveSession` and
+ * nothing that takes an id back out), so this performs the registry's own
+ * read-modify-write. It runs on the registry's private operation chain when
+ * that chain is present, because the chain is what serializes it against a
+ * concurrent `archiveSession` from the UI: a bare `domain.global.set` can read
+ * a snapshot another archive already moved past and write back a set that drops
+ * that other session. Without the chain the write still happens, exactly as it
+ * did before, so a rename upstream costs the ordering and not the feature.
+ * @param ctx - Host cordis context.
+ * @param id - the session to unarchive.
+ */
 const removeFromArchive = async (ctx: Context, id: SessionId): Promise<void> => {
   const registry = ctx.workspaceRegistry as unknown as {
     state?: { archivedSessionIds: SessionId[] };
+    enqueueOperation?<T>(operation: () => Promise<T>): Promise<T>;
   };
   const domain = (ctx.storageDomain as unknown as {
     get?: (name: string) => {
@@ -216,16 +312,26 @@ const removeFromArchive = async (ctx: Context, id: SessionId): Promise<void> => 
       };
     };
   }).get?.("workspace");
-  const current = domain?.global?.get();
-  if (current === undefined) return;
+  if (domain?.global === undefined) return;
+  const global = domain.global;
 
-  const nextIds = current.archivedSessionIds.filter((candidate) => candidate !== id);
-  if (nextIds.length !== current.archivedSessionIds.length) {
-    await domain?.global?.set({ ...current, archivedSessionIds: nextIds });
+  const unarchive = async (): Promise<void> => {
+    const current = global.get();
+    const nextIds = current.archivedSessionIds.filter((candidate) => candidate !== id);
+    if (nextIds.length === current.archivedSessionIds.length) return;
+    await global.set({ ...current, archivedSessionIds: nextIds });
     if (registry.state !== undefined) {
       registry.state = { ...registry.state, archivedSessionIds: nextIds };
     }
+  };
+
+  // Called as a registry method, not extracted first: the chain closes over the
+  // registry's own tail and pending-mutation recovery.
+  if (registry.enqueueOperation === undefined) {
+    await unarchive();
+    return;
   }
+  await registry.enqueueOperation(unarchive);
 };
 
 const findHeader = async (ctx: Context, id: SessionId): Promise<SessionHeader | undefined> => {
@@ -233,8 +339,10 @@ const findHeader = async (ctx: Context, id: SessionId): Promise<SessionHeader | 
   return headers.find((header) => header.id === id);
 };
 
+// `list` answers with per-session snapshots since 0.1.5; the header is the
+// only part this plugin reads.
 const safeList = async (ctx: Context): Promise<SessionHeader[]> =>
-  ctx.sessionPersistence.list();
+  (await ctx.sessionPersistence.list()).map((snapshot) => snapshot.header);
 
 /**
  * Wait for a cancelled agent to become idle, bounded so a wedged thread cannot

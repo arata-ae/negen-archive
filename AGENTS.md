@@ -6,7 +6,7 @@
 
 - **The harness checkout is read-only.** This repository depends on the published `@deepseek-ai/*` packages. Most of it uses public APIs; the host unarchive/delete path and the session-row menu patch reach a small, documented private-internals surface because upstream has no public delete/unarchive API or row-action slot.
 - **`lib/` is committed on purpose.** A git install should not need a build step on the far side. Run `pnpm build` in the same commit as a source change.
-- **The host half owns the filesystem safety boundary.** Live sessions are cancelled and awaited before their files are moved; no route deletes while an agent is still running.
+- **The host half owns the filesystem safety boundary.** No route deletes while an agent is still running: a live session is cancelled, awaited, then detached, and the drain that detachment triggers is waited out before its files move. The order is load-bearing. `session/disposed` is what makes the persistence backend close the session's write handle, and closing drains the handle's buffered events through the *original* path — so a drain that lands after the move re-creates the log, and the deleted thread comes back on the next list refresh.
 - **Delete goes to the operating system's trash, never to `rm` directly.** The host tries Finder, Recycle Bin, `gio trash`/`trash`, then the XDG trash layout before failing.
 
 ## Layout

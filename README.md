@@ -2,41 +2,22 @@
 
 A DeepSeek Harness plugin that adds a sidebar **Archived** action and a panel over the thread archive.
 
-The harness already has an archive set (`workspace.archiveSession`), but no visible way to see archived threads, unarchive them, or delete them. This plugin is the missing surface:
+The harness keeps an archive set (`workspace.archiveSession`) and no way to see what is in it. This plugin is that view:
 
-- **Archived panel** — every thread the registry hides from the grouping views, with title, project path, and update time.
-- **Restore** — removes a thread from the archive set, so it appears in the normal session tree again.
-- **Delete** — moves the thread's session directory to the operating system's native trash: Finder/`~/.Trash` on macOS, Recycle Bin on Windows, `gio trash` or the XDG Trash directory on Linux.
-
-It does not touch the vendored harness. The host half registers three small HTTP routes beside the existing gateway; the browser half is a footer action in the sidebar and a fourth Delete item in the session row ellipsis menu. It uses a small private-internals compatibility layer for unarchive and immediate live-session removal because upstream exposes no public API for those operations.
+- **Archived panel.** Every hidden thread, with title, project path, and update time.
+- **Restore.** Puts a thread back in the normal session tree.
+- **Delete.** Moves the session directory to the operating system's trash, so you can still pull it back out of Finder, the Recycle Bin, or the XDG trash.
 
 ## Install
 
-From this checkout while developing:
-
 ```sh
-dsh plugin --profile web add link:../negen-archive
+dsh plugin --profile web add github:arata-ae/negen-archive
 ```
 
-From a published package or git URL:
-
-```sh
-dsh plugin --profile web add @negen/archive
-```
-
-The bundle's `cordis.patch.yml` inserts one row after the web-app layer, so the host route and browser action activate as soon as the profile boots.
+Reload the window. The Archived button appears in the sidebar, and Delete appears in the session row menu.
 
 ## Safety
 
-- A live session is stopped first (the active turn is cancelled and awaited) before its files are moved to the OS trash.
-- "Delete" moves the whole session directory to the OS trash, not directly to `rm`. On macOS the preferred route is Finder via `osascript`, with `~/.Trash` as fallback; on Windows it uses PowerShell's `SendToRecycleBin`; on Linux it tries `gio trash`, then `trash`, then the XDG trash layout.
-- If the persistence backend has no per-session artifact (e.g. SQLite), delete is unavailable and returns `501`.
-
-## Build
-
-```sh
-pnpm install
-pnpm build
-```
-
-`lib/` is committed so a git install works without a build step on the user's machine — the same convention as `@negen/locale`.
+- Delete goes to the system trash, never straight to `rm`. To get a thread back, restore the session directory from there.
+- A session that is still running is stopped and its pending writes are flushed before anything moves, so a delete cannot corrupt the log it just detached.
+- If the persistence backend keeps no per-session directory, which means SQLite, Delete returns `501` and does nothing.

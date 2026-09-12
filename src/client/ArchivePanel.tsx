@@ -14,7 +14,8 @@ import {
   IconTrashOutline16,
   Modal,
 } from "@deepseek-ai/dsh-client-ui-primitives";
-import type { SessionId, SessionListState } from "@deepseek-ai/dsh-client-runtime/client";
+import type { SessionId } from "@deepseek-ai/dsh-session/types";
+import type { SessionListState } from "@deepseek-ai/dsh-api-session-controller/client";
 import type { ArchiveKey } from "./locales.ts";
 
 export interface ArchiveButtonProps {
@@ -200,7 +201,7 @@ export function ArchiveButton({
               <div key={id} style={STYLE_ROW}>
                 <div style={STYLE_MAIN}>
                   <div style={STYLE_TITLE}>
-                    {summary === undefined ? id : summary.title !== "" ? summary.title : id}
+                    {summary === undefined ? id : summary.displayTitle}
                   </div>
                   <div style={STYLE_META}>
                     {formatTime(summary?.updatedAt)}

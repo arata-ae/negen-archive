@@ -19,15 +19,20 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const lib = join(root, "lib");
 const manifest = JSON.parse(await readFile(join(root, "package.json"), "utf8"));
 
+// Mirrors PLATFORM_MODULES in the harness
+// (@deepseek-ai/dsh-client-web/src/platform.ts): the specifiers the shell
+// shares into its frozen module table. A name the shell does not seed is a
+// bundle the browser cannot materialize.
 const MODULE_TABLE = [
   "react",
   "react/jsx-runtime",
   "react-dom",
   "react-dom/client",
   "@deepseek-ai/cordis",
+  "@deepseek-ai/dsh-client-store",
   "@deepseek-ai/dsh-client-ui-slots",
   "@deepseek-ai/dsh-client-ui-primitives",
-  "@deepseek-ai/dsh-client-runtime/client",
+  "@deepseek-ai/dsh-client-ui-dockkit",
 ];
 
 await rm(lib, { recursive: true, force: true });

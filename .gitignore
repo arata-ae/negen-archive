@@ -1,2 +1,4 @@
 node_modules/
-lib/types/
+
+# lib/types is committed on purpose: a git install runs no build step, so the
+# declarations consumers resolve through package.json must be in the tarball.

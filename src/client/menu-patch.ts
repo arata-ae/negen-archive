@@ -2,9 +2,15 @@
  * Add a "Delete" item to the sidebar session-row ellipsis menu.
  *
  * The vendored ui-workspace client owns that menu and exposes no plugin slot
- * for extra rows, so this reaches the rendered DOM instead: it records which
- * session row opened the menu through React fiber props, then inserts one
- * Delete button after the menu's Archive row while the menu is open.
+ * for extra rows, so this reaches the rendered DOM instead: it inserts one
+ * Delete button after the menu's Archive row while the menu is open, and reads
+ * the owning session id from the menu's own React tree.
+ *
+ * The menu renders through `createPortal`, but a portal keeps the logical React
+ * tree, so walking `fiber.return` from a menu item still reaches the row's
+ * `SessionNodeItem` and its `node` prop. Resolving the id there, instead of
+ * from a pointer event, is what stops a keyboard-opened menu from inheriting
+ * whichever row was clicked last.
  *
  * This is intentionally a light compatibility layer, not a fork of the
  * workspace browser. If upstream ever adds a session-row action slot, this
@@ -14,22 +20,71 @@
 const MENU_SELECTOR = '[role="menu"]';
 const MENU_ITEM_SELECTOR = '[role="menuitem"], button';
 const DELETE_ATTR = 'data-negen-archive-delete';
+const CHANGED_EVENT = "negen-archive: changed";
 
-/** Walk up from a row DOM node to the nearest SessionNodeItem React fiber. */
-const sessionIdFromElement = (element: Element): string | undefined => {
+/** Rows in the session menu: Rename, Fork, Archive. The workspace menu has two. */
+const SESSION_MENU_ITEM_COUNT = 3;
+
+/** One React fiber, as far as this module reads it. */
+interface FiberLike {
+  readonly memoizedProps?: unknown;
+  readonly return?: FiberLike | null;
+}
+
+/**
+ * Whether a value is the browser's `SessionNode`, the only fiber prop carrying
+ * a deletable session id.
+ *
+ * Field-by-field on purpose: these props come out of React internals, and a
+ * shape that merely looks close enough would delete the wrong thread.
+ * @param value - candidate fiber prop.
+ * @returns true only for a complete `SessionNode`.
+ */
+const isSessionNode = (value: unknown): value is { readonly id: string } => {
+  if (typeof value !== "object" || value === null) return false;
+  const node = value as Record<string, unknown>;
+  return (
+    typeof node["id"] === "string"
+    && typeof node["title"] === "string"
+    && typeof node["updatedAt"] === "number"
+    && typeof node["blank"] === "boolean"
+    && typeof node["running"] === "boolean"
+  );
+};
+
+/** Read the React fiber attached to a DOM node. */
+const fiberOf = (element: Element): FiberLike | undefined => {
   const key = Object.keys(element).find((name) => name.startsWith("__reactFiber$"));
   if (key === undefined) return undefined;
-  let fiber = (element as unknown as Record<string, unknown>)[key] as {
-    memoizedProps?: { node?: { id?: unknown }; result?: { id?: unknown } } | null;
-    return?: unknown;
-  } | null;
+  return (element as unknown as Record<string, unknown>)[key] as FiberLike;
+};
+
+/**
+ * Walk up from a node inside the menu to the session row that owns it.
+ * @param element - node inside the portaled menu list.
+ * @returns the owning session id, or undefined when no session row owns this menu.
+ */
+const sessionIdFromMenu = (element: Element): string | undefined => {
+  let fiber: FiberLike | null | undefined = fiberOf(element);
   while (fiber !== null && fiber !== undefined) {
-    const props = fiber.memoizedProps;
-    if (props?.node?.id !== undefined) return String(props.node.id);
-    if (props?.result?.id !== undefined) return String(props.result.id);
-    fiber = fiber.return as never;
+    const props = fiber.memoizedProps as { readonly node?: unknown } | undefined;
+    if (props !== undefined && isSessionNode(props.node)) return props.node.id;
+    fiber = fiber.return;
   }
   return undefined;
+};
+
+/**
+ * Close an open menu through its own dismissal path.
+ *
+ * `Menu` listens for Escape on `document` and calls its `onClose`, so React
+ * unmounts the portaled list itself. Removing that node directly would tear a
+ * React-owned element out from under the reconciler.
+ * @param menu - the open menu list element.
+ */
+const closeMenu = (menu: Element): void => {
+  if (!menu.isConnected) return;
+  document.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", bubbles: true }));
 };
 
 const deleteSession = async (sessionId: string): Promise<void> => {
@@ -50,28 +105,26 @@ const deleteSession = async (sessionId: string): Promise<void> => {
   }
 };
 
-let capturedSessionId: string | undefined;
-
 const addDeleteItems = (getDeleteLabel: () => string): void => {
   for (const menu of document.querySelectorAll(MENU_SELECTOR)) {
     if (menu.querySelector(`[${DELETE_ATTR}]`) !== null) continue;
 
     const items = [...menu.querySelectorAll(MENU_ITEM_SELECTOR)];
-    // The session row menu is the only three-row action menu in the sidebar:
-    // Rename, Fork, Archive. The workspace menu has two rows. This guard keeps
-    // other three-item menus elsewhere in the app untouched and avoids relying
-    // on the locale-specific Archive label.
-    if (items.length !== 3) continue;
+    // The session row menu is the only three-row action menu in the sidebar.
+    // This guard keeps other menus elsewhere in the app untouched and avoids
+    // relying on the locale-specific Archive label.
+    if (items.length !== SESSION_MENU_ITEM_COUNT) continue;
     const archive = items.at(-1);
     if (archive === undefined) continue;
 
+    // No resolved row means no injected Delete. A menu that cannot name its own
+    // session must not offer to delete one, so the failure mode stays "the item
+    // is missing" rather than "the item deletes someone else's thread".
+    const sessionId = sessionIdFromMenu(archive);
+    if (sessionId === undefined) continue;
+
     const wrapper = archive.parentElement;
     if (wrapper === null) continue;
-    if (capturedSessionId === undefined) {
-      const fromMenu = sessionIdFromElement(archive);
-      if (fromMenu === undefined) continue;
-      capturedSessionId = fromMenu;
-    }
     const deleteWrap = document.createElement("div");
     deleteWrap.className = wrapper.className;
     const deleteItem = document.createElement("button");
@@ -97,19 +150,15 @@ const addDeleteItems = (getDeleteLabel: () => string): void => {
     deleteItem.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      // The session id was captured from the row that opened the menu.
-      const id = capturedSessionId;
-      if (id === undefined) return;
-      void deleteSession(id).then(
+      void deleteSession(sessionId).then(
         () => {
-          // Close the menu after a successful delete.
-          document.querySelector(MENU_SELECTOR)?.remove();
-          window.dispatchEvent(new Event("negen-archive: changed"));
+          closeMenu(menu);
+          window.dispatchEvent(new Event(CHANGED_EVENT));
         },
-        () => {
+        (error: unknown) => {
           // Menu interaction is fire-and-forget; a failure should at least
           // surface in console rather than silently doing nothing.
-          console.error("negen-archive: delete from row menu failed");
+          console.error("negen-archive: delete from row menu failed", error);
         },
       );
     });
@@ -120,26 +169,13 @@ const addDeleteItems = (getDeleteLabel: () => string): void => {
 
 let installed = false;
 
-const onPointerDown = (event: PointerEvent): void => {
-  const target = event.target as Element | null;
-  if (target === null) return;
-  const row = target.closest('[role="treeitem"]');
-  if (row !== null) {
-    capturedSessionId = sessionIdFromElement(row) ?? capturedSessionId;
-    return;
-  }
-  // A pointer that did not land in a session row (e.g. the model picker menu)
-  // must not inherit the previous row's id. Menus themselves stay untouched so
-  // clicking our injected Delete row keeps the id it was added with.
-  if (target.closest(MENU_SELECTOR) === null) {
-    capturedSessionId = undefined;
-  }
-};
-
 const onChanged = (): void => {
-  // If a delete happened elsewhere (the Archived panel), close any open
-  // row menu carrying our injected item so it does not linger stale.
-  document.querySelector(`[${DELETE_ATTR}]`)?.closest(MENU_SELECTOR)?.remove();
+  // If a delete happened elsewhere (the Archived panel), close any open row
+  // menu carrying our injected item so it does not linger stale.
+  const injected = document.querySelector(`[${DELETE_ATTR}]`);
+  if (injected === null) return;
+  const menu = injected.closest(MENU_SELECTOR);
+  if (menu !== null) closeMenu(menu);
 };
 
 /** Install the menu patch; returns a disposer for plugin teardown. */
@@ -148,8 +184,7 @@ export const installSessionMenuDelete = (
 ): (() => void) => {
   if (installed) return () => {};
   installed = true;
-  document.addEventListener("pointerdown", onPointerDown, true);
-  window.addEventListener("negen-archive: changed", onChanged);
+  window.addEventListener(CHANGED_EVENT, onChanged);
   const observer = new MutationObserver(() => {
     addDeleteItems(getDeleteLabel);
   });
@@ -157,8 +192,7 @@ export const installSessionMenuDelete = (
   addDeleteItems(getDeleteLabel);
   return () => {
     installed = false;
-    document.removeEventListener("pointerdown", onPointerDown, true);
-    window.removeEventListener("negen-archive: changed", onChanged);
+    window.removeEventListener(CHANGED_EVENT, onChanged);
     observer.disconnect();
   };
 };
