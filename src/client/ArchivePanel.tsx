@@ -10,8 +10,8 @@ import { useState } from "react";
 import type * as React from "react";
 import {
   Button,
-  IconArchiveOutline20,
-  IconTrashOutline16,
+  IconArchiveOutlineMedium,
+  IconTrashOutlineRegular,
   Modal,
 } from "@deepseek-ai/dsh-client-ui-primitives";
 import type { SessionId } from "@deepseek-ai/dsh-session/types";
@@ -180,7 +180,7 @@ export function ArchiveButton({
     <div style={{ display: "contents" }}>
       <style>{`.negen-archive-modal{width:min(800px,calc(100vw - 48px))!important;}.negen-archive-trigger:hover{background:var(--dsw-alias-interactive-bg-hover)!important;}`}</style>
       <button type="button" className="negen-archive-trigger" style={buttonStyle(wide)} onClick={() => { setOpen(true) }}>
-        <IconArchiveOutline20 size={wide ? 16 : 18} />
+        <IconArchiveOutlineMedium size={wide ? 16 : 18} />
         {wide && <span>{t("button.archived")}</span>}
       </button>
       <Modal
@@ -212,7 +212,7 @@ export function ArchiveButton({
                   <Button
                     variant="outline"
                     size="sm"
-                    icon={<IconArchiveOutline20 size={16} />}
+                    icon={<IconArchiveOutlineMedium size={16} />}
                     disabled={busy.has(id)}
                     onClick={() => { void run("/api/negen-archive/restore", id) }}
                   >
@@ -221,7 +221,7 @@ export function ArchiveButton({
                   <Button
                     variant="outline"
                     size="sm"
-                    icon={<IconTrashOutline16 />}
+                    icon={<IconTrashOutlineRegular size={16} />}
                     disabled={busy.has(id)}
                     style={{ color: "var(--dsw-alias-state-error-primary)" }}
                     onClick={() => { void run("/api/negen-archive/delete", id) }}

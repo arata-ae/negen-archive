@@ -1,15 +1,17 @@
 /**
  * Browser half for @negen/archive: a sidebar footer action that opens a panel
- * over the archived thread list. Restore and delete calls go to the host
- * routes registered by `src/index.ts`; no harness RPC is widened.
+ * over the archived thread list, plus a Delete row on every session-row menu.
+ * Delete calls the host route registered by `src/index.ts`; no harness RPC is
+ * widened.
  */
 
 import type { Context as ClientContext } from "@deepseek-ai/cordis";
 import type {} from "@deepseek-ai/dsh-client-ui-renderer/client";
 import type {} from "@deepseek-ai/dsh-client-ui-sidebar/client";
+import type {} from "@deepseek-ai/dsh-client-ui-workspace/client";
 import { ArchiveButton } from "./ArchivePanel.tsx";
+import { DeleteSessionMenuItem } from "./SessionMenuItem.tsx";
 import { NS, en, zh } from "./locales.ts";
-import { installSessionMenuDelete } from "./menu-patch.ts";
 
 export const name = "negen-archive";
 export const inject = ["slots", "sessions", "workspaces", "locale"];
@@ -36,14 +38,12 @@ export function apply(ctx: ClientContext): void {
   const locale = (ctx as unknown as {
     locale: {
       register(ns: string, dicts: Record<string, Record<string, string>>): () => void;
-      bind(ns: string): (key: string) => string;
     };
   }).locale;
   ctx.effect(
     () => locale.register(NS, { zh, en }),
     "negen-archive: dictionaries",
   );
-  const t = locale.bind(NS);
 
   // Only the session list needs a pull: the archive set reaches the browser on
   // the workspace follow stream, which the host-side write already publishes.
@@ -53,10 +53,6 @@ export function apply(ctx: ClientContext): void {
     });
   };
   window.addEventListener("negen-archive: changed", refreshAfterChange);
-  ctx.effect(
-    () => installSessionMenuDelete(() => t("action.delete")),
-    "negen-archive: session row delete item",
-  );
   ctx.effect(
     () => () => window.removeEventListener("negen-archive: changed", refreshAfterChange),
     "negen-archive: global refresh",
@@ -76,6 +72,21 @@ export function apply(ctx: ClientContext): void {
         }),
       },
       ArchiveButton,
+    ),
+  );
+
+  // Order 500 places Delete after the shipped Archive row (400). The row reads
+  // its own locale seat through the registration's namespace.
+  ctx.slots.inject("sidebar.workspaces.session.menu.item", () =>
+    ctx.slots.register(
+      {
+        name: "sidebar.workspaces.session.menu.item",
+        id: "negen-archive-delete",
+        order: 500,
+        locale: NS,
+        registrant: "negen-archive",
+      },
+      DeleteSessionMenuItem,
     ),
   );
 }

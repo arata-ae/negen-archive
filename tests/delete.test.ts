@@ -84,13 +84,10 @@ const makeHarness = async (
     })();
   };
 
+  // Stopping the running work belongs to the registry's stop providers now, so
+  // the stub records what the plugin *asked for* rather than a cancel this
+  // plugin performed itself.
   const agents = {
-    get: (): unknown => (options.live
-      ? {
-          cancel: (): void => { calls.push("cancel-agent"); },
-          whenIdle: async (): Promise<void> => { calls.push("agent-idle"); },
-        }
-      : undefined),
     store: new Map<string, unknown>(options.live ? [[SESSION_ID, { id: SESSION_ID }]] : []),
     detachEntered: (entry: { id: string }): void => {
       calls.push("detach-agent");
@@ -98,6 +95,9 @@ const makeHarness = async (
     },
   };
 
+  // Since 0.2.0 the registry owns both archive writes, so the stub's `state` is
+  // the read projection this plugin lists from and the durable record the
+  // registry verbs mutate — the same single source the real registry keeps.
   const state = { initialized: true, workspaceIds: [] as string[], archivedSessionIds: [SESSION_ID] };
   const ctx = {
     get: (name: string): unknown => {
@@ -106,22 +106,18 @@ const makeHarness = async (
       return undefined;
     },
     workspaceRegistry: {
-      state: { ...state },
-      enqueueOperation: async <T>(operation: () => Promise<T>): Promise<T> => {
+      state,
+      archiveSession: async (id: SessionId, archiveOptions?: { stopActivity?: boolean }): Promise<void> => {
         calls.push("registry-operation");
-        return await operation();
+        calls.push("archive-set-write");
+        if (archiveOptions?.stopActivity === true) calls.push("stop-activity");
+        if (!state.archivedSessionIds.includes(id)) state.archivedSessionIds.push(id);
       },
-    },
-    storageDomain: {
-      get: (): unknown => ({
-        global: {
-          get: (): typeof state => state,
-          set: async (value: typeof state): Promise<void> => {
-            calls.push("archive-set-write");
-            Object.assign(state, value);
-          },
-        },
-      }),
+      unarchiveSession: async (id: SessionId): Promise<void> => {
+        calls.push("registry-operation");
+        calls.push("archive-set-write");
+        state.archivedSessionIds = state.archivedSessionIds.filter((candidate) => candidate !== id);
+      },
     },
     sessionPersistence: {
       list: async (): Promise<unknown[]> => [{ header }],
@@ -159,13 +155,24 @@ test("a live session is drained before its files move", async () => {
   assert.deepEqual(await deleteSession(h.ctx, SESSION_ID, makeMover(h)), { kind: "deleted" });
 
   // The ordering, not a full transcript: each assertion is one half of the bug.
-  assert.ok(stepIndex(h, "cancel-agent") < stepIndex(h, "detach-session"), "the agent stops first");
+  assert.ok(stepIndex(h, "stop-activity") < stepIndex(h, "detach-session"), "the work stops first");
   assert.ok(stepIndex(h, "detach-session") < stepIndex(h, "flush"), "detaching is what triggers the drain");
   assert.ok(stepIndex(h, "flush") < stepIndex(h, "move"), "the drain settles before the files move");
   assert.ok(stepIndex(h, "drain-wrote") < stepIndex(h, "move"), "a buffered write must not land after the move");
-  assert.ok(stepIndex(h, "move") < stepIndex(h, "archive-set-write"), "the archive set updates last");
-  assert.ok(stepIndex(h, "registry-operation") < stepIndex(h, "archive-set-write"),
-    "the archive write runs on the registry's serialized chain");
+  assert.ok(stepIndex(h, "move") < h.calls.lastIndexOf("archive-set-write"),
+    "the archive set is left in its final state only after the files moved");
+});
+
+test("running work is stopped through the registry, not by cancelling one turn", async () => {
+  const h = await makeHarness({ live: true, locate: true });
+  await deleteSession(h.ctx, SESSION_ID, makeMover(h));
+
+  // The archive write precedes the stop requests, so every wake the stops
+  // induce is gated by a durable archive set. That gate is the reason a job or
+  // schedule cannot re-create the log after the move.
+  assert.ok(stepIndex(h, "archive-set-write") < stepIndex(h, "stop-activity"),
+    "the archive gate is durable before the stops are requested");
+  assert.ok(h.calls.includes("registry-operation"), "the stop runs on the registry's chain");
 });
 
 test("a deleted session stays deleted once a late write would have landed", async () => {

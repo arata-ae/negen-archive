@@ -1,10 +1,11 @@
 /**
  * Host half for @negen/archive.
  *
- * The harness has no session deletion or unarchive RPC, so this plugin owns a
- * small HTTP API beside the existing gateway. It uses only the services the
- * web profile already mounts: the webserver for routes, the workspace registry
- * for the archive set, and session persistence to locate session artifacts.
+ * The harness has no session deletion RPC, so this plugin owns a small HTTP API
+ * beside the existing gateway. It uses only the services the web profile
+ * already mounts: the webserver for routes, the workspace registry for the
+ * archive set and unarchive, and session persistence to locate session
+ * artifacts.
  *
  * The goal is deliberately modest:
  * - list threads currently hidden by the archive set
@@ -41,6 +42,10 @@ export type TrashMove = (target: string) => void;
  * so a drain that lands after the move re-creates the log and the deleted
  * thread comes back on the next list refresh. Detaching first, then waiting the
  * drain out, is what keeps the move final.
+ *
+ * The stop comes first and the archive-set write it implies is undone last, on
+ * purpose: while the session sits in the archive set, every wake the stop
+ * induces is already gated by it, so nothing new starts while the files move.
  * @param ctx - Host cordis context.
  * @param id - the session to delete.
  * @param move - the trash move, injectable so tests can run the sequence

@@ -4,9 +4,9 @@
 
 ## Standing rules
 
-- **The harness checkout is read-only.** This repository depends on the published `@deepseek-ai/*` packages. Most of it uses public APIs; the host unarchive/delete path and the session-row menu patch reach a small, documented private-internals surface because upstream has no public delete/unarchive API or row-action slot.
+- **The harness checkout is read-only.** This repository depends on the published `@deepseek-ai/*` packages, and most of it uses public APIs. The delete path reaches a small, documented private-internals surface because upstream still has no session-delete API: `sessionPersistence.locate`, the `sessions`/`agents` store entries, and the `session/disposed` edge their detach emits. Restore and the session-row menu item are ordinary public API since 0.2.0.
 - **`lib/` is committed on purpose.** A git install should not need a build step on the far side. Run `pnpm build` in the same commit as a source change.
-- **The host half owns the filesystem safety boundary.** No route deletes while an agent is still running: a live session is cancelled, awaited, then detached, and the drain that detachment triggers is waited out before its files move. The order is load-bearing. `session/disposed` is what makes the persistence backend close the session's write handle, and closing drains the handle's buffered events through the *original* path — so a drain that lands after the move re-creates the log, and the deleted thread comes back on the next list refresh.
+- **The host half owns the filesystem safety boundary.** No route deletes while work is still running: the registry is asked to stop the session's running work, then the session is detached, then the drain that detachment triggers is waited out before its files move. The order is load-bearing. `session/disposed` is what makes the persistence backend close the session's write handle, and closing drains the handle's buffered events through the *original* path — so a drain that lands after the move re-creates the log, and the deleted thread comes back on the next list refresh. The stop goes through `archiveSession({ stopActivity: true })` rather than a hand-rolled `agent.cancel`, because the turn is only one of four activity families the registry's stop providers cover: a subagent, background job or schedule that outlives the move resurrects the log the same way.
 - **Delete goes to the operating system's trash, never to `rm` directly.** The host tries Finder, Recycle Bin, `gio trash`/`trash`, then the XDG trash layout before failing.
 
 ## Layout
@@ -14,6 +14,6 @@
 | Path | What it owns |
 | --- | --- |
 | `src/index.ts` | host half: HTTP routes, archive-set update, restore/delete |
-| `src/client/` | browser half: sidebar footer action and archived threads panel |
-| `scripts/build.mjs` | builds `lib/` from `src/` |
+| `src/client/` | browser half: sidebar footer action, archived-threads panel, session-row Delete item |
+| `scripts/build.mjs` | builds `lib/` from `src/`; its module table mirrors the shell's `PLATFORM_MODULES` |
 | `cordis.patch.yml` | bundle patch inserting the one plugin row after `dsh-web-app` |

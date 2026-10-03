@@ -14,6 +14,7 @@ export type ArchiveKey =
   | "empty"
   | "action.restore"
   | "action.delete"
+  | "menu.confirmDelete"
   | "close";
 
 export const en: Record<ArchiveKey, string> = {
@@ -22,6 +23,7 @@ export const en: Record<ArchiveKey, string> = {
   "empty": "No archived threads.",
   "action.restore": "Restore",
   "action.delete": "Delete",
+  "menu.confirmDelete": "Delete permanently",
   "close": "Close",
 };
 
@@ -31,6 +33,7 @@ export const zh: Record<ArchiveKey, string> = {
   "empty": "没有已归档的线程。",
   "action.restore": "恢复",
   "action.delete": "删除",
+  "menu.confirmDelete": "永久删除",
   "close": "关闭",
 };
 

@@ -6,7 +6,7 @@
  * in the panel and the injected row menu must stay in this dictionary.
  */
 export declare const NS = "archive";
-export type ArchiveKey = "button.archived" | "panel.title" | "empty" | "action.restore" | "action.delete" | "close";
+export type ArchiveKey = "button.archived" | "panel.title" | "empty" | "action.restore" | "action.delete" | "menu.confirmDelete" | "close";
 export declare const en: Record<ArchiveKey, string>;
 export declare const zh: Record<ArchiveKey, string>;
 declare module "@deepseek-ai/dsh-client-ui-slots" {

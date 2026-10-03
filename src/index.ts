@@ -1,10 +1,11 @@
 /**
  * Host half for @negen/archive.
  *
- * The harness has no session deletion or unarchive RPC, so this plugin owns a
- * small HTTP API beside the existing gateway. It uses only the services the
- * web profile already mounts: the webserver for routes, the workspace registry
- * for the archive set, and session persistence to locate session artifacts.
+ * The harness has no session deletion RPC, so this plugin owns a small HTTP API
+ * beside the existing gateway. It uses only the services the web profile
+ * already mounts: the webserver for routes, the workspace registry for the
+ * archive set and unarchive, and session persistence to locate session
+ * artifacts.
  *
  * The goal is deliberately modest:
  * - list threads currently hidden by the archive set
@@ -17,7 +18,6 @@ import type { Context } from "@deepseek-ai/cordis";
 import type {} from "@deepseek-ai/dsh-host-webserver";
 import type {} from "@deepseek-ai/dsh-workspace";
 import type {} from "@deepseek-ai/dsh-session-persistence";
-import type {} from "@deepseek-ai/dsh-storage-domain";
 import type { SessionHeader, SessionId } from "@deepseek-ai/dsh-session";
 import { spawnSync } from "node:child_process";
 import { homedir } from "node:os";
@@ -34,12 +34,8 @@ export const inject = [
   "webServer",
   "workspaceRegistry",
   "sessionPersistence",
-  "storageDomain",
   "agents",
 ];
-
-/** how long delete waits for a live agent to stop before giving up */
-const AGENT_STOP_TIMEOUT_MS = 30_000;
 
 /** @param ctx - Host cordis context. */
 export function apply(ctx: Context): void {
@@ -156,6 +152,10 @@ export type TrashMove = (target: string) => void;
  * so a drain that lands after the move re-creates the log and the deleted
  * thread comes back on the next list refresh. Detaching first, then waiting the
  * drain out, is what keeps the move final.
+ *
+ * The stop comes first and the archive-set write it implies is undone last, on
+ * purpose: while the session sits in the archive set, every wake the stop
+ * induces is already gated by it, so nothing new starts while the files move.
  * @param ctx - Host cordis context.
  * @param id - the session to delete.
  * @param move - the trash move, injectable so tests can run the sequence
@@ -167,22 +167,18 @@ export const deleteSession = async (
   id: SessionId,
   move: TrashMove = moveToOsTrash,
 ): Promise<DeleteOutcome> => {
-  // Stop any live agent before the session is taken apart. Cancelling clears
-  // the active turn and waits for quiescence; the row can then be deleted
-  // safely even when it was the currently open thread.
-  const agent = ctx.get("agents")?.get(id) as
-    | {
-        cancel(cause: { kind: "user" }): void;
-        whenIdle(): Promise<void>;
-      }
-    | undefined;
-  if (agent !== undefined) {
-    agent.cancel({ kind: "user" });
-    await waitForAgentIdle(agent, id);
-  }
-
   const header = await findHeader(ctx, id);
   if (header === undefined) return { kind: "missing" };
+
+  // Stop the session's running work through the registry, not by cancelling the
+  // agent turn by hand. A turn is one family of four: `workspace/session-stop`
+  // also reaches the session's subagent descendants, its owned background jobs
+  // and its active schedules, through the same cancel paths the user's own stop
+  // actions use. A job or reminder that survives the move wakes later and
+  // writes its log back into the path that was just trashed, which is exactly
+  // the resurrection this whole order exists to prevent. The archive write this
+  // implies is undone below, so the set ends where it started either way.
+  await ctx.workspaceRegistry.archiveSession(id, { stopActivity: true });
 
   // `locate` left the persistence service in 0.1.5; the JSONL backend still
   // holds it as a private helper, and it stays the only thing that knows where
@@ -288,50 +284,15 @@ const detachLiveSession = (ctx: Context, id: SessionId): void => {
  * Remove one session from the registry-global archive set, which is what
  * "restore" means.
  *
- * Upstream has no public unarchive verb (0.1.5 exposes `archiveSession` and
- * nothing that takes an id back out), so this performs the registry's own
- * read-modify-write. It runs on the registry's private operation chain when
- * that chain is present, because the chain is what serializes it against a
- * concurrent `archiveSession` from the UI: a bare `domain.global.set` can read
- * a snapshot another archive already moved past and write back a set that drops
- * that other session. Without the chain the write still happens, exactly as it
- * did before, so a rename upstream costs the ordering and not the feature.
+ * `unarchiveSession` is upstream's own verb as of 0.2.0, so the write is the
+ * registry's and no longer this plugin's read-modify-write. Keep calling it —
+ * that is what puts the mutation on the registry's serialized operation chain
+ * and keeps a concurrent `archiveSession` from the UI from being clobbered.
  * @param ctx - Host cordis context.
  * @param id - the session to unarchive.
  */
 const removeFromArchive = async (ctx: Context, id: SessionId): Promise<void> => {
-  const registry = ctx.workspaceRegistry as unknown as {
-    state?: { archivedSessionIds: SessionId[] };
-    enqueueOperation?<T>(operation: () => Promise<T>): Promise<T>;
-  };
-  const domain = (ctx.storageDomain as unknown as {
-    get?: (name: string) => {
-      global?: {
-        get(): { archivedSessionIds: SessionId[] };
-        set(value: { archivedSessionIds: SessionId[] }): Promise<void>;
-      };
-    };
-  }).get?.("workspace");
-  if (domain?.global === undefined) return;
-  const global = domain.global;
-
-  const unarchive = async (): Promise<void> => {
-    const current = global.get();
-    const nextIds = current.archivedSessionIds.filter((candidate) => candidate !== id);
-    if (nextIds.length === current.archivedSessionIds.length) return;
-    await global.set({ ...current, archivedSessionIds: nextIds });
-    if (registry.state !== undefined) {
-      registry.state = { ...registry.state, archivedSessionIds: nextIds };
-    }
-  };
-
-  // Called as a registry method, not extracted first: the chain closes over the
-  // registry's own tail and pending-mutation recovery.
-  if (registry.enqueueOperation === undefined) {
-    await unarchive();
-    return;
-  }
-  await registry.enqueueOperation(unarchive);
+  await ctx.workspaceRegistry.unarchiveSession(id);
 };
 
 const findHeader = async (ctx: Context, id: SessionId): Promise<SessionHeader | undefined> => {
@@ -343,30 +304,6 @@ const findHeader = async (ctx: Context, id: SessionId): Promise<SessionHeader | 
 // only part this plugin reads.
 const safeList = async (ctx: Context): Promise<SessionHeader[]> =>
   (await ctx.sessionPersistence.list()).map((snapshot) => snapshot.header);
-
-/**
- * Wait for a cancelled agent to become idle, bounded so a wedged thread cannot
- * hang the delete request forever.
- */
-const waitForAgentIdle = async (
-  agent: { whenIdle(): Promise<void> },
-  id: SessionId,
-): Promise<void> => {
-  let timer: NodeJS.Timeout | undefined;
-  try {
-    await Promise.race([
-      agent.whenIdle(),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(
-          () => reject(new Error(`agent "${id}" did not stop within ${AGENT_STOP_TIMEOUT_MS}ms`)),
-          AGENT_STOP_TIMEOUT_MS,
-        );
-      }),
-    ]);
-  } finally {
-    if (timer !== undefined) clearTimeout(timer);
-  }
-};
 
 const readBody = <T>(req: IncomingMessage): Promise<T> =>
   new Promise((resolve, reject) => {
